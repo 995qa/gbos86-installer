@@ -1,0 +1,3 @@
+[submodule "gbos-x86"]
+	path = gbos-x86
+	url = https://github.com/linuxkid473/gbos-x86.git
