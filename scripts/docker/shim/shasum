@@ -1,0 +1,6 @@
+#!/bin/sh
+# make_gbos86_image.sh calls "shasum -a 256"; Debian's coreutils has sha256sum.
+if [ "${1:-}" = "-a" ]; then
+  shift 2
+fi
+exec sha256sum "$@"

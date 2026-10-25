@@ -1,0 +1,70 @@
+#!/bin/sh
+# Minimal docker shim used only while running the gbos-x86 build inside the
+# builder container. It understands the two invocations build.sh makes:
+#   docker info
+#   docker run [flags] IMAGE sh -c 'script'
+# Bind mounts are translated to symlinks because the "host" paths are already
+# paths inside this container.
+set -u
+
+if [ "${1:-}" = "info" ] || [ "${1:-}" = "version" ]; then
+  exit 0
+fi
+
+if [ "${1:-}" != "run" ]; then
+  echo "docker shim: unsupported command: $*" >&2
+  exit 1
+fi
+shift
+
+volumes=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rm|--privileged|-i|-t|-d) shift ;;
+    --platform|--cap-add|-e|-u|--user|--entrypoint|--name|--network) shift 2 ;;
+    -v|--volume) volumes="$volumes $2"; shift 2 ;;
+    --mount) echo "docker shim: --mount is not supported" >&2; exit 1 ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+
+if [ $# -lt 1 ]; then
+  echo "docker shim: missing image" >&2
+  exit 1
+fi
+IMAGE=$1
+shift
+
+links=""
+cleanup() {
+  for l in $links; do rm -f "$l" 2>/dev/null || true; done
+}
+trap cleanup EXIT INT TERM HUP
+
+for v in $volumes; do
+  host=${v%%:*}
+  rest=${v#*:}
+  cont=${rest%%:*}
+  [ -n "$host" ] || continue
+  [ -n "$cont" ] || continue
+  [ -d "$host" ] || mkdir -p "$host"
+  if [ ! -e "$cont" ]; then
+    ln -s "$host" "$cont" && links="$links $cont"
+  fi
+done
+
+rc=0
+if [ "${1:-}" = "sh" ] && [ "${2:-}" = "-c" ]; then
+  script=$3
+  sh -c "$script" || rc=$?
+elif [ "${1:-}" = "sh" ] && [ "${2:-}" = "-s" ]; then
+  sh -s || rc=$?
+else
+  "$@" || rc=$?
+fi
+
+cleanup
+trap - EXIT INT TERM HUP
+exit $rc

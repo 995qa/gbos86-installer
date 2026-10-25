@@ -1,0 +1,3 @@
+#!/bin/sh
+# All packages the nested build scripts install are already in the builder image.
+exit 0
