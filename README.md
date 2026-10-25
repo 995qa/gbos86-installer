@@ -20,3 +20,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```powershell
 dist\gbOS86-Installer.exe
 ```
+
+## Note
+
+This repo uses gbos-x86 to build a generic x86 image that works for 6th gen intel and higher. Go to their site (click on gbos-x86 submodule) for more details.
