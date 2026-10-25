@@ -1,3 +1,0 @@
-#!/bin/sh
-# The builder image already contains busybox-static and the other tools.
-exit 0
