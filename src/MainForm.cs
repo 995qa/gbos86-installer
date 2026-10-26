@@ -40,6 +40,7 @@ namespace GbOs86
         private ComboBox _diskCombo;
         private Button _refreshButton;
         private Label _diskDetails;
+        private CheckBox _makeRoom;
         private Label _envLabel;
         private TextBox _preflightBox;
         private Button _installButton;
@@ -84,7 +85,7 @@ namespace GbOs86
             root.ColumnCount = 1;
             root.RowCount = 4;
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 70F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 200F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 64F));
@@ -100,16 +101,8 @@ namespace GbOs86
             title.ForeColor = Color.White;
             title.Font = new Font("Segoe UI", 17F, FontStyle.Bold);
             title.AutoSize = true;
-            title.Location = new Point(18, 8);
+            title.Location = new Point(18, 11);
             _header.Controls.Add(title);
-
-            Label subtitle = new Label();
-            subtitle.Text = "Dual-boot installer for Windows PCs  -  builds and flashes the persistent gbOS86 loopback image";
-            subtitle.ForeColor = Color.FromArgb(203, 213, 225);
-            subtitle.Font = new Font("Segoe UI", 9.5F);
-            subtitle.AutoSize = true;
-            subtitle.Location = new Point(20, 43);
-            _header.Controls.Add(subtitle);
 
             _content = new Panel();
             _content.Dock = DockStyle.Fill;
@@ -206,7 +199,7 @@ namespace GbOs86
             _imageStatus.Text = "No image selected.";
             _imageGroup.Controls.Add(_imageStatus);
 
-            _diskGroup = MakeGroup("2.  Target disk", 198, 158);
+            _diskGroup = MakeGroup("2.  Target disk", 198, 172);
             _content.Controls.Add(_diskGroup);
 
             Label diskLabel = MakeLabel("Disk", 12, 28);
@@ -235,15 +228,24 @@ namespace GbOs86
 
             _diskDetails = new Label();
             _diskDetails.Location = new Point(12, 56);
-            _diskDetails.Size = new Size(956, 90);
+            _diskDetails.Size = new Size(956, 74);
             _diskDetails.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             _diskDetails.ForeColor = Color.FromArgb(55, 65, 81);
             _diskDetails.Text = "Reading disks...";
             _diskGroup.Controls.Add(_diskDetails);
 
-            _installGroup = MakeGroup("3.  Install", 364, 190);
+            _makeRoom = new CheckBox();
+            _makeRoom.Text = "Make room by shrinking the Windows volume when this disk has too little free space";
+            _makeRoom.Location = new Point(12, 134);
+            _makeRoom.Size = new Size(956, 24);
+            _makeRoom.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _makeRoom.Checked = true;
+            _makeRoom.CheckedChanged += delegate { RefreshPreflight(); };
+            _diskGroup.Controls.Add(_makeRoom);
+
+            _installGroup = MakeGroup("3.  Install", 378, 190);
             _content.Controls.Add(_installGroup);
-            _content.AutoScrollMinSize = new Size(0, 560);
+            _content.AutoScrollMinSize = new Size(0, 574);
 
             _envLabel = new Label();
             _envLabel.Location = new Point(12, 22);
@@ -556,6 +558,7 @@ namespace GbOs86
             int gen = ++_preflightGen;
             string path = _imagePath;
             DiskInfo disk = SelectedDisk();
+            bool makeRoom = _makeRoom.Checked;
 
             if (path.Length == 0 || disk == null)
             {
@@ -577,7 +580,7 @@ namespace GbOs86
                     // preflights do not rescan a large non-sparse image.
                     image.SaveExtentMap();
                     DiskService.ReadLabels(disk);
-                    PreflightResult p = InstallService.Preflight(disk, image);
+                    PreflightResult p = InstallService.Preflight(disk, image, makeRoom);
                     string imageText = DescribeImage(image);
                     string details = DescribeDisk(disk);
                     Ui(delegate
@@ -647,7 +650,10 @@ namespace GbOs86
                 return;
             }
 
-            string text = "Ready to install.  Windows and all existing partitions are left alone.\r\n";
+            string text = p.Shrink == null
+                ? "Ready to install.  Windows and all existing partitions are left alone.\r\n"
+                : "Ready to install.  " + p.Shrink.DisplayName + " will be shrunk by " + Fmt.Bytes(p.ShrinkBytes) +
+                  " to make room for gbOS86.  Windows stays the default boot option.\r\n";
             foreach (string w in p.Warnings) text += "WARNING: " + w + "\r\n";
             _preflightBox.BackColor = p.Warnings.Count > 0
                 ? Color.FromArgb(254, 249, 195) : Color.FromArgb(220, 252, 231);
@@ -759,14 +765,26 @@ namespace GbOs86
 
             PreflightResult p = _preflight;
             string existing = p.HasExisting ? "\n\nThe existing gbOS86 installation on this disk will be replaced." : "";
+            FreeExtent area = p.Shrink != null && p.PlannedFree != null ? p.PlannedFree : p.Free;
+            string where = area == null ? "" : "Free area: " + Fmt.Bytes(area.Length) +
+                                           " at offset " + Fmt.Bytes(area.Offset) + "\n";
+            string shrink = p.Shrink == null ? "" :
+                "\n\n" + p.Shrink.DisplayName + " will be shrunk by " + Fmt.Bytes(p.ShrinkBytes) +
+                " (from " + Fmt.Bytes(p.Shrink.VolumeSize) + " to " +
+                Fmt.Bytes(p.Shrink.VolumeSize - p.ShrinkBytes) + "). " +
+                "Uninstalling gbOS86 restores its size when possible.";
+            string action = p.Shrink == null
+                ? "Four partitions are created in unallocated space. Windows and all existing " +
+                  "partitions are not touched."
+                : "Four partitions are created in the space freed by shrinking " +
+                  p.Shrink.DisplayName + ".";
             DialogResult answer = MessageBox.Show(this,
                 "Install gbOS86 on this disk?\n\n" +
                 "Disk " + disk.Number + ": " + disk.Model + "\n" +
                 "Serial: " + disk.SerialOrUnknown + "\n" +
-                "Free area: " + Fmt.Bytes(p.Free.Length) + " at offset " + Fmt.Bytes(p.Free.Offset) + "\n" +
-                "gbOS86 will use: " + Fmt.Bytes(p.Required) + existing +
-                "\n\nFour partitions are created in unallocated space. Windows and all existing " +
-                "partitions are not touched. Do not close this window or power off during the write.\n\n" +
+                where +
+                "gbOS86 will use: " + Fmt.Bytes(p.Required) + existing + shrink +
+                "\n\n" + action + " Do not close this window or power off during the write.\n\n" +
                 "Continue?",
                 "Install gbOS86", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button2);
@@ -806,13 +824,11 @@ namespace GbOs86
                         _state = InstallState.Load();
                         _uninstallButton.Enabled = _state != null;
                         RefreshDisks();
-                        string how = report.BootEntry != null && report.BootEntry.Native
-                            ? "Restart the PC and press F12 (or your boot-menu key), then choose gbOS86."
-                            : "A gbOS86 entry was added to the Windows Boot Manager. If the Windows boot " +
-                              "menu is enabled, choose it there; otherwise press F12 at startup and pick gbOS86.";
                         MessageBox.Show(this,
-                            "gbOS86 was installed on disk " + disk.Number + ".\n\n" + how +
-                            "\n\nKeep Secure Boot off: gbOS86's boot loader is not signed.\n" +
+                            "gbOS86 was installed on disk " + disk.Number + ".\n\n" +
+                            "Restart the PC and press F12 (or your boot-menu key), then choose gbOS86.\n\n" +
+                            "The gbOS86 EFI partition appears in the firmware boot menu.\n" +
+                            "Keep Secure Boot off: gbOS86's boot loader is not signed.\n" +
                             "Windows remains the default boot option.\n\nLog: " + Log.FilePath,
                             "gbOS86 installed", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     });
@@ -860,7 +876,7 @@ namespace GbOs86
             string when = state.InstalledAt.Length > 0 ? "\nInstalled: " + state.InstalledAt : "";
             DialogResult answer = MessageBox.Show(this,
                 "Remove gbOS86 from disk " + state.DiskNumber + "?" + when +
-                "\n\nThe gbOS86 partitions and its boot entry will be deleted. " +
+                "\n\nThe gbOS86 partitions will be deleted. " +
                 "Windows and all other partitions are not touched.",
                 "Uninstall gbOS86", MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button2);
@@ -924,6 +940,7 @@ namespace GbOs86
             _busy = busy;
             _diskCombo.Enabled = !busy;
             _refreshButton.Enabled = !busy;
+            _makeRoom.Enabled = !busy;
             _buildRadio.Enabled = !busy;
             _existingRadio.Enabled = !busy;
             _cancelButton.Enabled = busy;

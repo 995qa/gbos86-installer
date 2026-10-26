@@ -1,7 +1,8 @@
-// UEFI boot entry management. The primary path writes Boot####/BootOrder
-// firmware variables directly (what a Linux installer's efibootmgr does); the
-// fallback copies the Windows Boot Manager entry with bcdedit when firmware
-// refuses variable writes.
+// UEFI boot entry management. The installer no longer adds an entry: firmware
+// boot menus list the new EFI partition on their own. What remains here is used
+// to find and remove entries written by earlier versions of the installer.
+// Add() (Boot####/BootOrder, with the bcdedit Windows Boot Manager fallback) is
+// kept for reference and covered by the offline tests.
 using System;
 using System.Collections.Generic;
 using System.Globalization;

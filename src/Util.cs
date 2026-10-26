@@ -471,6 +471,12 @@ namespace GbOs86
             return int.TryParse(Get(key, ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : fallback;
         }
 
+        public ulong GetU64(string key, ulong fallback)
+        {
+            ulong v;
+            return ulong.TryParse(Get(key, ""), NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : fallback;
+        }
+
         public bool GetBool(string key, bool fallback)
         {
             string v = Get(key, "").ToLowerInvariant();

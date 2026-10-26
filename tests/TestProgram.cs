@@ -22,6 +22,8 @@ namespace GbOs86
                 TestGptParser();
                 TestGptRejectsCorruption();
                 TestFreeSpace();
+                TestShrinkPlanning();
+                TestRawDiskAccess();
                 TestSparseExtents();
                 TestPackedImage();
                 TestUefiDevicePathData();
@@ -143,6 +145,144 @@ namespace GbOs86
             List<FreeExtent> after = DiskService.ComputeFreeExtents(d, exclude);
             Check(after.Count == 2 && after[1].Length == 849UL * 1024 * 1024,
                 "free space after removing a partition", after.Count + " " + after[after.Count - 1]);
+        }
+
+        private static void TestShrinkPlanning()
+        {
+            // Same layout as a default Windows install: Windows, then a
+            // Recovery partition at the end, then free space.
+            DiskInfo split = new DiskInfo();
+            split.Size = 100UL * 1024 * 1024 * 1024;
+            split.Partitions.Add(Part(1, 1, 80 * 1024));
+            split.Partitions.Add(Part(2, 1 + 80 * 1024, 500));
+
+            FreeExtent before = DiskService.FreeSpaceAfterShrink(split, 1, 0, null);
+            Check(before.Length == 19978UL * 1024 * 1024, "free space before shrink", before.ToString());
+
+            // Shrinking Windows cannot merge with the free area behind the
+            // Recovery partition, so the largest area stays the same.
+            FreeExtent afterSplit;
+            ulong splitPlan = DiskService.PlanShrink(split, 1, 30UL * 1024 * 1024 * 1024,
+                10UL * 1024 * 1024 * 1024, null, out afterSplit);
+            Check(splitPlan == 0 && afterSplit.Length == 19978UL * 1024 * 1024,
+                "shrink behind a recovery partition does not help", splitPlan + " " + afterSplit);
+
+            // Without the partition in the way, shrinking extends the same area.
+            DiskInfo straight = new DiskInfo();
+            straight.Size = 100UL * 1024 * 1024 * 1024;
+            straight.Partitions.Add(Part(1, 1, 80 * 1024));
+
+            FreeExtent planned;
+            ulong plan = DiskService.PlanShrink(straight, 1, 30UL * 1024 * 1024 * 1024,
+                80UL * 1024 * 1024 * 1024, null, out planned);
+            Check(plan == 10242UL * 1024 * 1024, "smallest shrink that fits", plan.ToString());
+            Check(planned.Length == 30UL * 1024 * 1024 * 1024 &&
+                  planned.Offset == 71679UL * 1024 * 1024, "free area after the planned shrink", planned.ToString());
+
+            ulong noPlan = DiskService.PlanShrink(straight, 1, 10UL * 1024 * 1024 * 1024,
+                80UL * 1024 * 1024 * 1024, null, out planned);
+            Check(noPlan == 0 && planned.Length == 20478UL * 1024 * 1024,
+                "no shrink when the free area is already large enough", noPlan.ToString());
+
+            FreeExtent capped;
+            ulong cappedPlan = DiskService.PlanShrink(straight, 1, 30UL * 1024 * 1024 * 1024,
+                5000UL * 1024 * 1024, null, out capped);
+            Check(cappedPlan == 0 && capped.Length == 25478UL * 1024 * 1024,
+                "shrink stops at the volume's minimum size", capped.ToString());
+
+            // Prefer the running Windows volume unless another volume can free
+            // more than it can.
+            ShrinkCandidate system = new ShrinkCandidate();
+            system.IsSystem = true;
+            system.VolumeSize = 100UL * 1024 * 1024 * 1024;
+            system.SizeMin = 90UL * 1024 * 1024 * 1024;
+            ShrinkCandidate other = new ShrinkCandidate();
+            other.VolumeSize = 500UL * 1024 * 1024 * 1024;
+            other.SizeMin = 100UL * 1024 * 1024 * 1024;
+            List<ShrinkCandidate> candidates = new List<ShrinkCandidate>();
+            candidates.Add(other);
+            candidates.Add(system);
+            Check(DiskService.PickShrinkCandidate(candidates, 5UL * 1024 * 1024 * 1024) == system,
+                "prefer the Windows volume", null);
+            Check(DiskService.PickShrinkCandidate(candidates, 50UL * 1024 * 1024 * 1024) == other,
+                "fall back to the volume that can free more", null);
+        }
+
+        private static byte PatternByte(long i)
+        {
+            // Depends on the high bits too, so blocks 8 MiB apart differ.
+            return (byte)((i * 31) ^ (i >> 20) ^ (i >> 9));
+        }
+
+        private static bool Matches(byte[] buffer, long start, int count)
+        {
+            for (int i = 0; i < count; i++)
+                if (buffer[i] != PatternByte(start + i)) return false;
+            return true;
+        }
+
+        private static string FirstMismatch(byte[] buffer, long start)
+        {
+            for (int i = 0; i < buffer.Length; i++)
+                if (buffer[i] != PatternByte(start + i))
+                    return "byte " + i + " is 0x" + buffer[i].ToString("x2");
+            return "";
+        }
+
+        private static void TestRawDiskAccess()
+        {
+            // A short read has to land in the caller's buffer. Verify reads a
+            // partition's final, smaller block into a 4 MiB scratch buffer that
+            // still holds the previous block; a read that only filled an
+            // internal copy made the disk look as if it had returned the
+            // previous block's bytes.
+            string path = Path.Combine(_temp, "rawdisk.bin");
+            int size = (9 << 20) + 1234;
+            byte[] whole = new byte[size];
+            for (int i = 0; i < size; i++) whole[i] = PatternByte(i);
+            File.WriteAllBytes(path, whole);
+
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+            using (RawDisk raw = new RawDisk(fs.SafeFileHandle, true))
+            {
+                byte[] big = new byte[4 << 20];
+
+                raw.ReadAt(0, big, big.Length);
+                Check(Matches(big, 0, big.Length), "full-size raw read", null);
+
+                // The regression: a smaller block read into a buffer that still
+                // holds the previous block.
+                raw.ReadAt(8 << 20, big, 1 << 20);
+                Check(Matches(big, 8L << 20, 1 << 20), "short raw read fills the buffer",
+                    FirstMismatch(big, 8L << 20));
+
+                big[1500] = 0x11;
+                raw.ReadAt(512, big, 512);
+                Check(Matches(big, 512, 512), "short raw read at a small offset", null);
+                Check(big[1500] == 0x11, "short raw read leaves the rest untouched", null);
+
+                byte[] head = new byte[4096];
+                raw.ReadAt(1 << 20, head, head.Length);
+                Check(Matches(head, 1L << 20, head.Length), "4 KiB raw read", null);
+
+                // Writes copy the right slice out of a larger buffer.
+                byte[] block = new byte[4096];
+                for (int i = 0; i < block.Length; i++) block[i] = 0xA5;
+                raw.WriteAt((4 << 20) + 300, block, 1000);
+                raw.Flush();
+
+                raw.ReadAt((4 << 20) + 256, big, 1024);
+                bool wrote = true;
+                for (int i = 0; i < 1024; i++)
+                {
+                    long at = (4L << 20) + 256 + i;
+                    byte want = at >= (4L << 20) + 300 && at < (4L << 20) + 1300
+                        ? (byte)0xA5
+                        : PatternByte(at);
+                    if (big[i] != want) { wrote = false; break; }
+                }
+                Check(wrote, "partial raw write lands at the right offset", null);
+            }
         }
 
         private static void TestSparseExtents()

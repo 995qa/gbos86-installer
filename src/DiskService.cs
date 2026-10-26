@@ -112,6 +112,54 @@ namespace GbOs86
         public bool NoDefaultLetter;
     }
 
+    /// <summary>
+    /// An NTFS volume that Windows reports as shrinkable. SizeMin is the
+    /// smallest size the volume can have without moving unmovable files, so
+    /// MaxShrink is a hard upper bound.
+    /// </summary>
+    internal sealed class ShrinkCandidate
+    {
+        public int DiskNumber;
+        public int PartitionNumber;
+        public string DriveLetter = "";
+        public string Label = "";
+        public ulong VolumeSize;
+        public ulong VolumeFree;
+        public ulong SizeMin;
+        public bool IsSystem;
+
+        public ulong MaxShrink
+        {
+            get
+            {
+                ulong byMin = VolumeSize > SizeMin ? VolumeSize - SizeMin : 0;
+                // Never propose wiping a volume completely, even if the probe
+                // reports a nonsensical minimum.
+                ulong limit = VolumeSize > DiskService.GiB ? VolumeSize - DiskService.GiB : 0;
+                return byMin < limit ? byMin : limit;
+            }
+        }
+
+        public string DriveText
+        {
+            get { return DriveLetter.Length == 0 ? "" : DriveLetter + ":"; }
+        }
+
+        public string DisplayName
+        {
+            get
+            {
+                string name = Label.Length > 0 ? Label : (IsSystem ? "Windows" : "volume");
+                return DriveText.Length > 0 ? name + " (" + DriveText + ")" : name;
+            }
+        }
+
+        public override string ToString()
+        {
+            return DisplayName + ", " + Fmt.Bytes(VolumeSize) + ", can shrink by " + Fmt.Bytes(MaxShrink);
+        }
+    }
+
     internal static class DiskService
     {
         public const ulong MiB = 1024UL * 1024UL;
@@ -518,6 +566,171 @@ namespace GbOs86
             return alignment == 0 ? value : value - (value % alignment);
         }
 
+        /// <summary>
+        /// Largest free extent that would exist if <paramref name="partitionNumber"/>
+        /// were shrunk by <paramref name="shrinkBytes"/>. Used to plan a shrink
+        /// before anything on the disk is changed.
+        /// </summary>
+        public static FreeExtent FreeSpaceAfterShrink(DiskInfo disk, int partitionNumber, ulong shrinkBytes,
+            List<int> exclude)
+        {
+            DiskInfo probe = new DiskInfo();
+            probe.Number = disk.Number;
+            probe.Size = disk.Size;
+            probe.PartitionStyle = disk.PartitionStyle;
+            probe.Partitions = new List<PartitionInfo>();
+            foreach (PartitionInfo p in disk.Partitions)
+            {
+                if (p.Number != partitionNumber || shrinkBytes == 0)
+                {
+                    probe.Partitions.Add(p);
+                    continue;
+                }
+                PartitionInfo q = new PartitionInfo();
+                q.DiskNumber = p.DiskNumber;
+                q.Number = p.Number;
+                q.DriveLetter = p.DriveLetter;
+                q.Offset = p.Offset;
+                q.Size = p.Size > shrinkBytes ? p.Size - shrinkBytes : 0;
+                q.Type = p.Type;
+                q.GptType = p.GptType;
+                q.Guid = p.Guid;
+                q.AccessPaths = p.AccessPaths;
+                q.Label = p.Label;
+                q.Fs = p.Fs;
+                q.LabelRead = p.LabelRead;
+                probe.Partitions.Add(q);
+            }
+
+            FreeExtent best = null;
+            foreach (FreeExtent f in ComputeFreeExtents(probe, exclude))
+                if (best == null || f.Length > best.Length) best = f;
+            return best == null ? new FreeExtent(0, 0) : best;
+        }
+
+        /// <summary>
+        /// Smallest MiB-aligned shrink of the partition that produces one free
+        /// area large enough for <paramref name="required"/>, or 0 when even the
+        /// maximum shrink cannot. <paramref name="resultingFree"/> reports the
+        /// largest area after the planned shrink (or after the maximum shrink
+        /// when no plan exists) so the caller can explain a shortfall.
+        /// </summary>
+        public static ulong PlanShrink(DiskInfo disk, int partitionNumber, ulong required, ulong maxShrink,
+            List<int> exclude, out FreeExtent resultingFree)
+        {
+            resultingFree = FreeSpaceAfterShrink(disk, partitionNumber, 0, exclude);
+            if (required == 0 || resultingFree.Length >= required) return 0;
+
+            ulong maxMiB = maxShrink / MiB;
+            if (maxMiB == 0) return 0;
+
+            FreeExtent maxFree = FreeSpaceAfterShrink(disk, partitionNumber, maxShrink, exclude);
+            if (maxFree.Length < required)
+            {
+                resultingFree = maxFree;
+                return 0;
+            }
+
+            ulong lo = 1;
+            ulong hi = maxMiB;
+            while (lo < hi)
+            {
+                ulong mid = lo + (hi - lo) / 2;
+                if (FreeSpaceAfterShrink(disk, partitionNumber, mid * MiB, exclude).Length >= required)
+                    hi = mid;
+                else
+                    lo = mid + 1;
+            }
+            resultingFree = FreeSpaceAfterShrink(disk, partitionNumber, lo * MiB, exclude);
+            return lo * MiB;
+        }
+
+        /// <summary>
+        /// Prefer the running Windows volume when it can free enough space;
+        /// otherwise use the volume that can free the most (its error message
+        /// is the most useful one).
+        /// </summary>
+        public static ShrinkCandidate PickShrinkCandidate(List<ShrinkCandidate> candidates, ulong required)
+        {
+            ShrinkCandidate system = null;
+            ShrinkCandidate largest = null;
+            foreach (ShrinkCandidate c in candidates)
+            {
+                if (c.IsSystem) system = c;
+                if (largest == null || c.MaxShrink > largest.MaxShrink) largest = c;
+            }
+            if (system != null && system.MaxShrink >= required) return system;
+            return largest;
+        }
+
+        /// <summary>
+        /// Asks the Storage module which NTFS volumes on the disk can be shrunk
+        /// and by how much. Needs administrator rights (the installer always
+        /// runs elevated); returns an empty list when the query is unavailable.
+        /// </summary>
+        public static List<ShrinkCandidate> ProbeShrinkCandidates(DiskInfo disk)
+        {
+            List<ShrinkCandidate> result = new List<ShrinkCandidate>();
+            if (disk == null) return result;
+
+            string systemDrive = "";
+            try
+            {
+                string sys = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                if (sys.Length >= 2) systemDrive = sys.Substring(0, 1).ToUpperInvariant();
+            }
+            catch { }
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("$ErrorActionPreference='Stop'");
+            sb.AppendLine("$disk=" + disk.Number.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine("Get-Partition -DiskNumber $disk -ErrorAction Stop | ForEach-Object {");
+            sb.AppendLine("  $letter=$_.DriveLetter");
+            sb.AppendLine("  if (-not $letter) { return }");
+            sb.AppendLine("  $vol=$null");
+            sb.AppendLine("  try { $vol = Get-Volume -DriveLetter $letter -ErrorAction Stop } catch { return }");
+            sb.AppendLine("  if (-not $vol) { return }");
+            sb.AppendLine("  if ($vol.FileSystem -ne 'NTFS') { return }");
+            sb.AppendLine("  $sup=$null");
+            sb.AppendLine("  try { $sup = Get-PartitionSupportedSize -DiskNumber $disk -PartitionNumber $_.PartitionNumber -ErrorAction Stop } catch { return }");
+            sb.AppendLine("  if (-not $sup) { return }");
+            sb.AppendLine("  $label = [string]$vol.FileSystemLabel");
+            sb.AppendLine("  $label = $label -replace '[|\\r\\n]', ' '");
+            sb.AppendLine("  Write-Output ('SHRINK|' + $_.PartitionNumber + '|' + $letter + '|' + $label + '|' + $_.Size + '|' + $sup.SizeMin + '|' + $vol.SizeRemaining)");
+            sb.AppendLine("}");
+            sb.AppendLine("Write-Output 'OK'");
+
+            ProcessResult r = ProcessRunner.RunPowerShell(sb.ToString(), 180000);
+            if (r.StdOut.IndexOf("OK", StringComparison.Ordinal) < 0)
+                Log.Write("Shrink probe failed: " + Fmt.OneLine(r.Combined, 300));
+
+            foreach (string line in Lines(r.StdOut))
+            {
+                if (!line.StartsWith("SHRINK|", StringComparison.Ordinal)) continue;
+                string[] f = line.Split('|');
+                if (f.Length < 7) continue;
+                int n;
+                ulong size, sizeMin, free;
+                if (!int.TryParse(f[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out n)) continue;
+                if (!ulong.TryParse(f[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out size)) continue;
+                if (!ulong.TryParse(f[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out sizeMin)) continue;
+                if (!ulong.TryParse(f[6], NumberStyles.Integer, CultureInfo.InvariantCulture, out free)) continue;
+
+                ShrinkCandidate c = new ShrinkCandidate();
+                c.DiskNumber = disk.Number;
+                c.PartitionNumber = n;
+                c.DriveLetter = f[2].Trim();
+                c.Label = f[3].Trim();
+                c.VolumeSize = size;
+                c.SizeMin = sizeMin;
+                c.VolumeFree = free;
+                c.IsSystem = c.DriveLetter.Length > 0 &&
+                             string.Equals(c.DriveLetter, systemDrive, StringComparison.OrdinalIgnoreCase);
+                result.Add(c);
+            }
+            return result;
+        }
+
         public static void Refresh()
         {
             ProcessRunner.RunPowerShell(
@@ -726,23 +939,28 @@ namespace GbOs86
             return (s == null ? "" : s).Replace("'", "''");
         }
 
-        public static void ShrinkPartition(int diskNumber, int partitionNumber, ulong shrinkBytes)
+        /// <summary>
+        /// Resize an existing partition with Resize-Partition. Windows refuses
+        /// sizes outside Get-PartitionSupportedSize; the message says which
+        /// limit was hit so the caller can explain it to the user.
+        /// </summary>
+        public static void ResizePartition(int diskNumber, int partitionNumber, ulong newSize)
         {
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("$ErrorActionPreference='Stop'");
-            sb.AppendLine("$d=" + diskNumber);
-            sb.AppendLine("$n=" + partitionNumber);
-            sb.AppendLine("$shrink=[uint64]" + shrinkBytes.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine("$d=" + diskNumber.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine("$n=" + partitionNumber.ToString(CultureInfo.InvariantCulture));
+            sb.AppendLine("$new=[uint64]" + newSize.ToString(CultureInfo.InvariantCulture));
             sb.AppendLine("$p = Get-Partition -DiskNumber $d -PartitionNumber $n -ErrorAction Stop");
             sb.AppendLine("$sup = Get-PartitionSupportedSize -DiskNumber $d -PartitionNumber $n -ErrorAction Stop");
-            sb.AppendLine("$new = [uint64]$p.Size - $shrink");
-            sb.AppendLine("if ($new -lt [uint64]$sup.SizeMin) { throw \"This volume cannot be shrunk that far. The smallest it can be is \" + [math]::Round([uint64]$sup.SizeMin/1GB,1) + \" GB.\" }");
+            sb.AppendLine("if ($new -lt [uint64]$sup.SizeMin) { throw (\"Windows cannot shrink this volume that far. The smallest it can be is \" + [math]::Round([uint64]$sup.SizeMin/1GB,1) + \" GB.\") }");
+            sb.AppendLine("if ($new -gt [uint64]$sup.SizeMax) { throw (\"Windows cannot grow this volume that far. The largest it can be is \" + [math]::Round([uint64]$sup.SizeMax/1GB,1) + \" GB.\") }");
             sb.AppendLine("Resize-Partition -DiskNumber $d -PartitionNumber $n -Size $new -ErrorAction Stop");
             sb.AppendLine("Update-Disk -Number $d -ErrorAction SilentlyContinue");
             sb.AppendLine("Write-Output (\"OK|\" + $new)");
             ProcessResult r = ProcessRunner.RunPowerShell(sb.ToString(), 0);
             if (!r.Success || r.StdOut.IndexOf("OK|", StringComparison.Ordinal) < 0)
-                throw new InvalidOperationException("Could not shrink the volume.\n\n" + r.Combined);
+                throw new InvalidOperationException("Could not resize the volume.\n\n" + r.Combined);
         }
 
         public static bool? SecureBootEnabled
